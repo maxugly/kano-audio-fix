@@ -108,6 +108,19 @@ sudo dmesg | grep -i pcm100   # should return nothing
 - **Bluetooth audio**: A2DP playback
 - **Headset microphone**: The nau8825 codec's mic input via the 3.5mm jack (untested but expected to work)
 
+## Known Issue: pavucontrol / Audio Settings
+
+**Do not keep pavucontrol (PulseAudio Volume Control) or other audio settings panels open.** These applications continuously poll and refresh audio device state. Each refresh triggers PipeWire to re-enumerate devices, which probes pcm100 (DMIC16kHz), briefly crashes the DSP, and causes:
+
+- Audio output to flicker between "Dummy Output" and the Raptor Lake devices
+- The Configuration tab to jump between "Pro Audio" and "Off" profiles
+- YouTube/video playback to stutter and require manual restart
+- An on-screen display (OSD) to appear and flicker in the center of the screen
+
+Close the audio settings panel and everything works perfectly. This happens because pavucontrol triggers ACP re-enumeration through the PulseAudio compatibility layer, which probes ALL PCM devices including the DMIC. The UCM override prevents the DMIC from being *configured* as an audio device, but the ACP still probes it for *capability discovery*.
+
+**A complete fix** would require recompiling the SOF topology (`sof-rpl-max98373-nau8825.tplg`) without DMIC widgets, or fixing the NHLT table in the Chromebook firmware. This is tracked as a future improvement.
+
 ## What We Tried (And Why It Failed)
 
 This section documents the full debugging journey across 12+ reboots and 6 hours of investigation. It's here so the next person doesn't repeat our mistakes.
