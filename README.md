@@ -1,68 +1,37 @@
 # Kano Audio Fix
 
-Fixes the SOF (Sound Open Firmware) DSP crash loop on **Google Kano** Chromebooks running mainline Linux.
+Complete fix for the SOF (Sound Open Firmware) DSP crash loop on **Google Kano** Chromebooks running mainline Linux. Stops the audio stack from crashing and makes DaVinci Resolve, pavucontrol, and all other applications work.
 
-## Problem
+## The Problem
 
-On Google Kano (Raptor Lake, board name "Kano"), the SOF audio driver creates DMIC (digital microphone) PCM devices from the topology file. The BIOS does not provide an NHLT table, so the DSP has no routing information for the DMICs. When PipeWire's ACP (ALSA Card Profile) plugin probes the DMIC16kHz PCM device (`hw:0,100`) during device enumeration, the DSP rejects the stream parameters with IPC error -22, enters a wedged state, and all audio stops working.
+On Google Kano (Raptor Lake), the SOF topology includes DMIC (digital microphone) PCM devices, but the BIOS doesn't provide an NHLT table (`NHLT table not found`). The DSP can't route the DMIC stream. When PipeWire's ACP plugin probes `hw:0,100` (DMIC16kHz), the DSP crashes with `IPC error -22 (EINVAL)`.
 
-**Symptoms:**
-- Volume meters move but no sound output
-- `dmesg` shows repeated `sof-audio-pci-intel-tgl: ipc tx error for 0x60010000`
-- `dmesg` shows `NHLT table not found` and `DMICs detected in NHLT tables: 0`
-- PipeWire logs `spa.alsa: snd_pcm_avail after recover: Broken pipe` on the speaker PCM
-- Browser pages and video players freeze when attempting playback
-- Audio stack appears to "power cycle" repeatedly
-- Intermittently: brief bursts of audio between DSP crashes
+**Three cascading failures make this catastrophic:**
 
-## Hardware
+1. **The DMIC probe crashes the DSP globally** — not just the microphone, but speakers, headset, HDMI, everything
+2. **WirePlumber amplifies the crash** — its error recovery cycles the card profile (Off → On), re-probing the DMIC and creating an infinite loop
+3. **The DSP crash is worse when idle** — if no audio is playing, the DMIC probe causes a "hard" crash that takes 15-30 seconds to recover from. When audio is actively flowing, the crash is "soft" and the DSP recovers instantly
 
-- **Device**: Google Kano (Chromebook)
-- **CPU**: Intel Raptor Lake P
-- **Audio**: max98373 smart amplifiers (×2 stereo) + nau8825 headset codec on SoundWire/I2S, DMIC array, HDMI via i915
-- **SOF topology**: `sof-rpl-max98373-nau8825.tplg` (symlink → `sof-adl-max98373-nau8825.tplg`)
-- **Firmware**: `sof-rpl.ri` (symlink → `sof-tgl.ri`)
-- **Tested on**: CachyOS (Arch-based), Linux 7.1.2-3-cachyos, PipeWire 1.6.7, WirePlumber 0.5.x
+## The Fix (Three Components)
 
-## Root Cause
+### 1. WirePlumber ALSA Monitor Patch
 
-Three interacting issues:
+Patches `/usr/share/wireplumber/scripts/monitors/alsa.lua` to remove the destructive profile cycling in `monitorNodeError()`. Instead of setting the card to "Off" and back (which kills all audio), it simply logs the error. This breaks the infinite crash loop.
 
-### 1. Missing NHLT table
+### 2. PipeWire Suspend Timeout = 0
 
-The Chromebook BIOS does not provide a Non-HD Audio Link Table, so SOF cannot auto-detect DMIC routing or endpoint count. Without NHLT, the DSP has no information about how the DMIC array is physically connected.
+Sets `suspend-timeout = 0` so PipeWire never suspends ALSA nodes. The DSP stays in an active power state. DMIC probes cause "soft" crashes that recover instantly instead of "hard" crashes that wedge the DSP for 30 seconds.
 
-### 2. Topology/DMIC mismatch
+### 3. DMIC Device Node Removal
 
-The SOF topology file (`sof-rpl-max98373-nau8825.tplg`) includes DMIC widgets (DMIC0, DMIC1, DMIC16kHz). The DSP tries to configure these widgets using the topology parameters, but without NHLT data, the hardware routing is incorrect. When any process opens the DMIC PCM, the DSP rejects the stream configuration with `-EINVAL` (IPC error -22).
+Udev rule removes `/dev/snd/pcmC0D99c` and `/dev/snd/pcmC0D100c` so userspace ALSA applications (DaVinci Resolve, mpv with ALSA backend) can't open the DMIC directly. Combined with the warm DSP from fix #2, any remaining probe paths cause transient, harmless errors.
 
-### 3. PipeWire ACP probing
+### Belt-and-Suspenders (included but not strictly necessary)
 
-PipeWire's ALSA Card Profile (ACP) plugin, driven by WirePlumber's ALSA monitor, enumerates ALL PCM devices on the sound card during startup. It opens `hw:0,100` (DMIC16kHz) to query its capabilities. The DSP crashes. At cold boot, this crash is severe enough to also break the speaker and headset pipelines, triggering a full card re-enumeration. The re-enumeration probes the DMIC again, creating an infinite crash loop.
-
-**Why runtime restarts sometimes work but cold boot doesn't:** At cold boot, all PCM pipelines are being initialized for the first time. The DMIC crash corrupts DSP state broadly enough to break the speaker/headset initialization. PipeWire/WirePlumber detect the speaker failure and restart, re-probing everything including the DMIC. At runtime restart, the speaker and headset pipelines are already configured and cached — the DMIC crash is isolated enough that the DSP recovers before it affects other pipelines.
-
-## The Fix
-
-Three components, applied together:
-
-### Component 1: Kernel parameter — `dmic_num=0`
-
-`/etc/default/limine` (or kernel cmdline): `snd_sof_intel_hda_generic.dmic_num=0`
-
-This tells the SOF driver not to expose DMIC PCM devices to userspace. It partially hides them from `arecord -l` but does **not** remove them from `/proc/asound/`. This parameter alone is insufficient because PipeWire's ACP plugin accesses PCM devices through the ALSA card's internal device list, not through the user-facing device enumeration.
-
-### Component 2: UCM profile override — `dmic.conf`
-
-`/etc/alsa/ucm2/sof-soundwire/dmic.conf` — redirects the DMIC capture device to `hw:0,999` (a non-existent device).
-
-This is the critical fix. PipeWire's ACP plugin reads the UCM (Use Case Manager) profile to discover which PCM devices to probe. The chromebook-linux-audio project installs a UCM profile at `/usr/share/alsa/ucm2/sof-soundwire/dmic.conf` that maps the DMIC. By overriding it to point to device 999, the ACP plugin gets a clean "no such device" error instead of opening the real DMIC and crashing the DSP.
-
-### Component 3: WirePlumber disable rule (belt and suspenders)
-
-`/etc/wireplumber/wireplumber.conf.d/51-disable-dmic.conf` — sets `node.disabled = true` on any ALSA nodes matching DMIC device numbers 99 or 100.
-
-If the UCM override doesn't catch every probe path, this rule prevents WirePlumber from creating audio nodes for the DMIC devices. The crash occurs before node creation (at the SPA/ACP level), so this rule alone doesn't fix the problem — but it prevents any DMIC nodes from appearing in the audio UI.
+- **`dmic_num=0`** kernel parameter: Partially hides DMIC from `arecord -l`
+- **UCM profile override**: Redirects DMIC to non-existent device 999
+- **WirePlumber node.disabled rule**: Prevents DMIC from appearing as PulseAudio sources
+- **udev SOUND_IGNORE**: Tags DMIC PCM devices as ignored
 
 ## Installation
 
@@ -73,145 +42,85 @@ sudo bash install.sh
 sudo reboot
 ```
 
-After reboot, verify:
+## Verification
 
 ```bash
+# Audio playback works
 paplay /usr/share/sounds/alsa/Front_Center.wav
+
+# DMIC may crash once at boot, then never again
+sudo dmesg | grep pcm100
 ```
 
-Check that no DMIC crashes appear in dmesg:
+## What You Lose
 
-```bash
-sudo dmesg | grep -i pcm100   # should return nothing
-```
+- **Built-in DMIC array**: Digital microphones will not work. Use USB or Bluetooth for mic input.
+- **Headset microphone (nau8825)**: Should still work.
+
+## Key Discoveries
+
+### YouTube Fixes Everything
+
+Early in debugging, we found that playing a YouTube video made all audio problems disappear. This was the crucial clue: **the DSP is fragile when idle.** When PipeWire suspends ALSA nodes (default: after 5 seconds of silence), the DSP enters a low-power state. DMIC probes during this state cause severe crashes. When audio flows, the DSP stays active and DMIC probes are harmless.
+
+### DaVinci Resolve: The ALSA Direct Path
+
+DaVinci appears in pavucontrol as `Pipewire [ALSA]:Resolve` — it uses PipeWire's ALSA plugin directly, not PulseAudio. Its Fairlight engine calls `snd_device_name_hint()` during startup, which opens every ALSA device including `hw:0,100` (DMIC16kHz). This is what was crashing the DSP and locking DaVinci's audio output.
+
+### WirePlumber's Error Recovery Kills Everything
+
+WirePlumber's `monitorNodeError()` function was designed to recover from transient USB/HDMI errors by cycling the card profile. On Chromebooks with unreliable DSPs, this created a self-sustaining crash loop. Every cycle also caused dangerous loud pops through the max98373 amplifiers.
+
+## What We Tried (Full Debugging History)
+
+### Attempts That Failed
+
+| # | Attempt | Result | Why |
+|---|---------|--------|-----|
+| 1 | Legacy HDA (`dsp_driver=1`) | No sound card | Speakers on SoundWire, not HDA |
+| 2 | AVS driver (`dsp_driver=4`) | Dummy output | No AVS firmware for Raptor Lake |
+| 3 | Runtime PM disable | No effect | DSP isn't asleep — it's crashed |
+| 4 | SOF + dmic_num=0 | Same crashes | pcm100 still in /proc/asound |
+| 5 | AVS blacklist (`modprobe.blacklist`) | HDA loaded instead | AVS was stealing device |
+| 6 | Clean boot (after removing leftover modprobe.d) | SOF loaded, DSP crashed | Back to square one |
+| 7 | DMIC codec blacklist (`snd_soc_dmic`) | No sound card | Topology fails without DMIC widgets |
+| 8 | `dmic_num=0` with actual SOF | pcm100 still crashes | Doesn't remove from topology |
+| 9 | `asound.conf` null device | Works at runtime, fails at boot | ACP bypasses alsa-lib routing |
+| 10 | WirePlumber `node.disabled` rule | Still crashes | Crash before node creation |
+| 11 | udev `SOUND_IGNORE` rule | No effect | ACP doesn't check udev |
+| 12 | `/dev/snd` node removal | Userspace stopped, ACP still probes | ACP uses card FD |
+| 13 | `disable_function_topology=1` | No effect | Doesn't remove DMIC |
+| 14 | LTS kernel (6.18) | Same behavior | Same firmware, same topology |
+| 15 | Newer SOF firmware (v2025.12.2) | Identical files | No updates for RPL max98373-nau8825 |
+
+### The modprobe.d Betrayal
+
+A file written in Attempt 1 (`/etc/modprobe.d/snd-fix.conf` with `dsp_driver=1`) was accidentally left in place. For **6 subsequent reboot cycles**, it silently forced legacy HDA — making us believe we were testing SOF parameters when we were actually running HDA with HDMI-only audio. Always verify with `cat /sys/module/snd_intel_dspcfg/parameters/dsp_driver`.
+
+### The AVS Turf War
+
+On CachyOS with kernel 7.1.2, `snd_soc_avs` loads before `snd_sof_pci_intel_tgl` and claims the audio PCI device. AVS then fails because firmware is missing, but SOF never gets a chance. Blacklisting AVS fixes this, but then auto-detection may pick legacy HDA instead of SOF.
+
+### What Finally Worked
+
+The three-component fix documented above. Each component addresses a different layer of the cascade failure, and all three are needed:
+
+1. **WirePlumber patch** → breaks the error recovery loop
+2. **suspend-timeout=0** → keeps DSP warm (YouTube effect)
+3. **Device node removal** → blocks userspace ALSA probes
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `install.sh` | Copies all config files, updates bootloader, rebuilds initramfs |
-| `dmic-override.conf` | UCM profile override — redirects DMIC to non-existent device 999 |
-| `51-disable-dmic.conf` | WirePlumber rule — disables DMIC audio nodes |
-| `51-hide-dmic.rules` | Udev rule — sets SOUND_IGNORE on DMIC PCM devices (belt and suspenders) |
-| `asound.conf` | ALSA null device config — redirects DMIC PCMs to null (runtime fallback) |
+| `install.sh` | Full installer — applies all three fixes + belt-and-suspenders |
+| `dmic-override.conf` | UCM profile override (belt-and-suspenders) |
 
-## What You Lose
+## Related
 
-- **DMIC (built-in digital microphone array)**: Will not work. If you need microphone input, use a USB or Bluetooth headset.
-- **Voice input daemons**: Any daemon using `plughw:0,99` or `hw:0,100` will fail silently.
-
-## What Still Works
-
-- **Speakers**: max98373 stereo speakers
-- **Headset output**: nau8825 headset jack
-- **HDMI audio**: All HDMI/DisplayPort outputs
-- **Bluetooth audio**: A2DP playback
-- **Headset microphone**: The nau8825 codec's mic input via the 3.5mm jack (untested but expected to work)
-
-## Known Issue: pavucontrol / Audio Settings
-
-**Do not keep pavucontrol (PulseAudio Volume Control) or other audio settings panels open.** These applications continuously poll and refresh audio device state. Each refresh triggers PipeWire to re-enumerate devices, which probes pcm100 (DMIC16kHz), briefly crashes the DSP, and causes:
-
-- Audio output to flicker between "Dummy Output" and the Raptor Lake devices
-- The Configuration tab to jump between "Pro Audio" and "Off" profiles
-- YouTube/video playback to stutter and require manual restart
-- An on-screen display (OSD) to appear and flicker in the center of the screen
-
-Close the audio settings panel and everything works perfectly. This happens because pavucontrol triggers ACP re-enumeration through the PulseAudio compatibility layer, which probes ALL PCM devices including the DMIC. The UCM override prevents the DMIC from being *configured* as an audio device, but the ACP still probes it for *capability discovery*.
-
-**A complete fix** would require recompiling the SOF topology (`sof-rpl-max98373-nau8825.tplg`) without DMIC widgets, or fixing the NHLT table in the Chromebook firmware. This is tracked as a future improvement.
-
-## What We Tried (And Why It Failed)
-
-This section documents the full debugging journey across 12+ reboots and 6 hours of investigation. It's here so the next person doesn't repeat our mistakes.
-
-### Attempt 1: Legacy HDA driver (`dsp_driver=1`)
-
-Wrote `/etc/modprobe.d/snd-fix.conf` with `options snd-intel-dspcfg dsp_driver=1`.
-
-**Result:** No sound card. **Why:** The max98373 speakers and nau8825 headset are on SoundWire/I2S, not the HDA bus. The legacy HDA driver only handles HDA-attached codecs (HDMI). This file was accidentally left in place through 6 subsequent attempts, silently overriding all kernel command line changes and making us think we were testing SOF parameters when we were actually just running legacy HDA over and over.
-
-### Attempt 2: AVS driver (`dsp_driver=4`)
-
-Added `snd_intel_dspcfg.dsp_driver=4` to kernel command line.
-
-**Result:** "Dummy output." **Why:** The AVS driver needs firmware at `intel/avs/adl/dsp_basefw.bin` which is not packaged for CachyOS. Firmware load fails, driver bails out.
-
-### Attempt 3: Runtime PM fix
-
-`echo on > /sys/bus/pci/devices/0000:00:1f.3/power/control` to disable audio DSP power management.
-
-**Result:** No change. **Why:** The DSP wasn't asleep — it was actively wedged from the DMIC probe crash.
-
-### Attempt 4: SOF with DMIC disabled (`dsp_driver=2 + dmic_num=0`)
-
-Added both to kernel command line.
-
-**Result:** No sound card. **Why:** `dsp_driver=2` on this kernel prevents the machine driver (`snd_soc_sof_nau8825`) from binding. But also: the modprobe.d file from Attempt 1 was still active, so we were actually running legacy HDA the whole time.
-
-### Attempt 5: AVS vs SOF turf war discovery
-
-Tried `dsp_driver=2` with AVS blacklisted. Discovered that even with `dsp_driver=2`, `snd_soc_avs` binds to the audio PCI device first, fails to load firmware, and blocks SOF.
-
-**Fix:** Blacklisted `snd_soc_avs` in modprobe.d. But the modprobe.d from Attempt 1 still overrode everything to legacy HDA.
-
-### Attempt 6: No params, AVS blacklist only
-
-Clean kernel cmdline, `blacklist snd_soc_avs` in modprobe.d.
-
-**Result:** Legacy HDA loaded (HDMI-only). **Why:** Without `dsp_driver=2`, auto-detection picked HDA over SOF. And the Attempt 1 file was still there forcing `dsp_driver=1` anyway.
-
-### Attempt 7: The snd-fix.conf discovery
-
-Found `/etc/modprobe.d/snd-fix.conf` from Attempt 1 still in place, forcing `dsp_driver=1` through every test. Deleted it.
-
-**Result:** SOF finally loaded. `sof-nau8825` card appeared. But back to the original broken pipe + DMIC crash loop.
-
-**Lesson:** Modprobe.d configs override kernel command line for module parameters. Always clean up test files.
-
-### Attempt 8: DMIC module blacklist (`modprobe.blacklist=snd_soc_dmic`)
-
-**Result:** No sound card. **Why:** The topology file requires DMIC widgets (`snd_soc_dmic`) to parse. Without it, topology loading fails, and no sound card is created.
-
-### Attempt 9: `dmic_num=0` with SOF actually running
-
-Finally tested `dmic_num=0` with real SOF. DMIC devices disappeared from `arecord -l` but pcm100 still existed in `/proc/asound/` and was still probed through the UCM/ACP path.
-
-### Attempt 10: ALSA null device (`asound.conf`)
-
-Created `/etc/asound.conf` with null device overrides for pcm99 and pcm100. Worked at runtime (restart wireplumber → DSP recovered after one crash) but failed at cold boot because PipeWire's ACP plugin opens devices through the UCM path, bypassing alsa-lib's PCM routing.
-
-### Attempt 11: WirePlumber node.disabled rule
-
-Created `/etc/wireplumber/wireplumber.conf.d/51-disable-dmic.conf` to disable DMIC nodes. Reduced crashes from infinite loop to ~3 bursts, then stable.
-
-**Why partially effective:** WirePlumber's rules only prevent node CREATION, not device PROBING. The ACP plugin probes the DMIC during enumeration (before node creation), so the crash still happens — but with fewer nodes to error-handle, the DSP recovers faster.
-
-### Attempt 12: Udev SOUND_IGNORE
-
-Created `/etc/udev/rules.d/51-hide-dmic.rules` setting `SOUND_IGNORE=1` on pcmC0D99c and pcmC0D100c.
-
-**Result:** No effect. **Why:** PipeWire's ACP plugin opens devices through the sound card's file descriptor, not through `/dev/snd/` nodes. The udev flag isn't checked at this level.
-
-### Attempt 13: Permissions lockout
-
-`chmod 000` on `/dev/snd/pcmC0D99c` and `/dev/snd/pcmC0D100c`.
-
-**Result:** No effect. Same reason as above — the ACP plugin uses the card FD, not the device nodes.
-
-### Attempt 14 (THE FIX): UCM profile override
-
-Created `/etc/alsa/ucm2/sof-soundwire/dmic.conf` redirecting DMIC to `hw:0,999`.
-
-**Result:** Complete fix. PipeWire's ACP plugin reads the UCM profile, sees DMIC mapped to device 999, tries to open it, gets "no such device," and moves on. The real DMIC (devices 99, 100) is never touched. No DSP crash. Stable audio.
-
-**Why this works when nothing else did:** The ACP plugin's device enumeration is driven entirely by the UCM profile. It doesn't blindly probe all PCM devices — it only probes what the UCM tells it to. By replacing the DMIC entry with a dead-end device number, we prevent the DSP crash at its source: the ALSA device open call.
-
-## Related Projects
-
-- [chromebook-linux-audio](https://github.com/WeirdTreeThing/chromebook-linux-audio) — Prerequisite: run this first to install SOF firmware symlinks and UCM profiles
-- [WirePlumber](https://pipewire.pages.freedesktop.org/wireplumber/) — Session manager documentation
-- [SOF Project](https://thesofproject.github.io/latest/index.html) — Sound Open Firmware documentation
+- [chromebook-linux-audio](https://github.com/WeirdTreeThing/chromebook-linux-audio) — Run this first for firmware symlinks and UCM profiles
+- [kano-audio-fix](https://github.com/maxugly/kano-audio-fix) — This repo
+- [SOF Project](https://thesofproject.github.io/latest/index.html)
 
 ## License
 
