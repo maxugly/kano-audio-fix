@@ -1,0 +1,5 @@
+# Hide DMIC PCM devices from userspace — prevents SOF DSP crash on Google Kano
+# The DMIC (pcmC0D99c, pcmC0D100c) causes IPC errors when probed because
+# the BIOS doesn't provide NHLT tables. PipeWire probes them and crashes the DSP.
+SUBSYSTEM=="sound", KERNEL=="pcmC0D99c", ENV{SOUND_IGNORE}="1"
+SUBSYSTEM=="sound", KERNEL=="pcmC0D100c", ENV{SOUND_IGNORE}="1"
